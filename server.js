@@ -3,135 +3,84 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { WebcastPushConnection } = require('tiktok-live-connector');
 
-// 1. 서버 기본 설정
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "*", // 모든 게임 클라이언트 접속 허용
-        methods: ["GET", "POST"]
-    }
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
-// ==========================================
-// ★ [설정 구역] 여기에 연결할 틱톡 아이디 입력
-// ==========================================
-const TIKTOK_USERNAME = "ishowspeed"; // 예시: 현재 방송 중인 아무나, 나중엔 본인 아이디
+// ★ 핵심: 접속된 틱톡 연결들을 관리하는 대장부
+// { "bts_official": 연결객체, "ishowspeed": 연결객체 ... }
+const activeConnections = {};
 
-// ★ [선물 맵핑] 특정 선물이 오면 어떤 유닛을 소환할지 설정
-const GIFT_MAPPING = {
-    // 예: 선물ID "5670" (장미) -> 보병 소환
-    "5670": { type: "soldier", power: 10 }, 
-    // 예: 선물ID "5671" (도넛) -> 탱크 소환
-    "5671": { type: "tank", power: 100 }
-};
-
-// 2. 틱톡 연결 옵션 (안정성 강화)
-const tiktokOptions = {
-    processInitialData: false,      // 서버 켜기 전 데이터 무시
-    enableExtendedGiftInfo: true,   // 선물 이미지 정보 가져오기
-    enableWebsocketUpgrade: true,
-    requestPollingIntervalMs: 2000  // 2초마다 연결 상태 확인
-};
-
-let tiktokConnection = new WebcastPushConnection(TIKTOK_USERNAME, tiktokOptions);
-
-// 3. 틱톡 라이브 연결 시도
-console.log(`[시스템] ${TIKTOK_USERNAME}님의 방송에 연결을 시도합니다...`);
-
-tiktokConnection.connect().then(state => {
-    console.info(`[연결 성공] 방 ID: ${state.roomId}`);
-}).catch(err => {
-    console.error(`[연결 실패] ${TIKTOK_USERNAME}님이 방송 중이 아니거나 오류가 발생했습니다.`, err);
-});
-
-// ==========================================
-// 4. 이벤트 처리 (틱톡 -> 게임)
-// ==========================================
-
-// (1) 선물 (Gift) - 핵심 로직
-tiktokConnection.on('gift', data => {
-    // 콤보 중간 생략 (마지막 콤보나 단일 선물만 처리)
-    if (data.giftType === 1 && !data.repeatEnd) return;
-
-    const giftId = data.giftId.toString();
-    const coins = data.diamondCount * data.repeatCount;
-    const userName = data.uniqueId;
-    const userProfile = data.profilePictureUrl;
-
-    console.log(`[선물] ${userName}: ${data.giftName} (코인: ${coins})`);
-
-    let gameData = {
-        type: 'gift',
-        user: userName,
-        profile: userProfile,
-        giftName: data.giftName,
-        iconUrl: data.giftPictureUrl,
-        coins: coins,
-        amount: data.repeatCount,
-        action: 'spawn_unit', // 기본 액션
-        unitType: 'none'      // 유닛 종류
-    };
-
-    // A. 맵핑된 선물인지 확인
-    if (GIFT_MAPPING[giftId]) {
-        gameData.unitType = GIFT_MAPPING[giftId].type;
-        console.log(`>> [특수 효과] 지정된 선물: ${gameData.unitType}`);
-    } 
-    // B. 맵핑 안 된 선물은 가격으로 자동 분류
-    else {
-        if (coins >= 100) gameData.unitType = "boss";
-        else if (coins >= 10) gameData.unitType = "tank";
-        else if (coins >= 1) gameData.unitType = "soldier";
-        console.log(`>> [일반 효과] 가격 비례: ${gameData.unitType}`);
-    }
-
-    // 게임으로 전송
-    io.emit('game_event', gameData);
-});
-
-// (2) 소셜 이벤트 (팔로우, 공유)
-tiktokConnection.on('social', data => {
-    let eventType = null;
-    if (data.displayType.includes('follow')) eventType = 'follow';
-    if (data.displayType.includes('share')) eventType = 'share';
-
-    if (eventType) {
-        console.log(`[소셜] ${data.uniqueId}님이 ${eventType} 했습니다.`);
-        io.emit('game_event', {
-            type: eventType,
-            user: data.uniqueId
-        });
-    }
-});
-
-// (3) 채팅 (Chat)
-tiktokConnection.on('chat', data => {
-    io.emit('chat', {
-        user: data.uniqueId,
-        msg: data.comment
-    });
-});
-
-// (4) 좋아요 (Like)
-tiktokConnection.on('like', data => {
-    io.emit('game_event', {
-        type: 'like',
-        user: data.uniqueId,
-        count: data.likeCount,
-        total: data.totalLikeCount
-    });
-});
-
-// 5. 클라이언트 접속 확인
 io.on('connection', (socket) => {
-    console.log('[게임] 클라이언트 접속됨 ID:', socket.id);
+    console.log(`[클라이언트 접속] 소켓ID: ${socket.id}`);
+
+    // 1. 클라이언트(게임)가 "나 누구랑 연결해줘"라고 요청하면 실행
+    socket.on('set_channel', (tiktokId) => {
+        if (!tiktokId) return;
+
+        console.log(`[요청] 클라이언트(${socket.id})가 [${tiktokId}] 방송 연결을 요청함.`);
+        
+        // 소켓을 해당 크리에이터의 '방(Room)'에 입장시킴
+        socket.join(tiktokId);
+
+        // 이미 서버가 그 틱톡커와 연결되어 있다면? -> 또 연결할 필요 없음
+        if (activeConnections[tiktokId]) {
+            console.log(`>> [중복 방지] 이미 [${tiktokId}] 방송에 연결되어 있습니다. 데이터만 공유합니다.`);
+            return;
+        }
+
+        // 2. 새로운 틱톡커라면 -> 새로 연결 시작!
+        startTikTokConnection(tiktokId);
+    });
 });
 
-// 6. 서버 시작 (클라우드 포트 사용)
+// ★ 틱톡 연결을 생성하고 관리하는 함수
+function startTikTokConnection(tiktokId) {
+    let connection = new WebcastPushConnection(tiktokId, {
+        processInitialData: false,
+        enableExtendedGiftInfo: true,
+        enableWebsocketUpgrade: true,
+        requestPollingIntervalMs: 2000
+    });
+
+    connection.connect().then(state => {
+        console.info(`[연결 성공] ${tiktokId} (RoomID: ${state.roomId})`);
+    }).catch(err => {
+        console.error(`[연결 실패] ${tiktokId}:`, err);
+        // 실패 시 목록에서 삭제 (재시도 가능하게)
+        delete activeConnections[tiktokId];
+    });
+
+    // 이벤트 리스너 등록
+    
+    // (1) 선물
+    connection.on('gift', data => {
+        if (data.giftType === 1 && !data.repeatEnd) return;
+
+        const processedData = {
+            type: 'gift',
+            user: data.uniqueId,
+            giftName: data.giftName,
+            coins: data.diamondCount * data.repeatCount,
+            iconUrl: data.giftPictureUrl
+        };
+
+        // ★ 중요: 이 틱톡커(tiktokId) 방에 있는 사람들에게만 전송!
+        io.to(tiktokId).emit('game_event', processedData);
+    });
+
+    // (2) 채팅
+    connection.on('chat', data => {
+        io.to(tiktokId).emit('chat', { user: data.uniqueId, msg: data.comment });
+    });
+
+    // ... 필요한 다른 이벤트들도 같은 방식으로 추가 (like, social 등)
+
+    // 연결 목록에 저장
+    activeConnections[tiktokId] = connection;
+}
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log('--------------------------------------------------');
-    console.log(`★ Livooth 게임 서버 가동 중 (포트: ${PORT})`);
-    console.log('--------------------------------------------------');
+    console.log(`★ Livooth 멀티 채널 서버 가동 중 (포트: ${PORT})`);
 });
