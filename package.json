@@ -1,0 +1,17 @@
+{
+  "name": "livooth-game-server",
+  "version": "1.0.0",
+  "description": "Livooth Interactive Game Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "tiktok-live-connector": "^1.1.5"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
