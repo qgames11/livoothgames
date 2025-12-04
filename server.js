@@ -2,337 +2,241 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { WebcastPushConnection } = require('tiktok-live-connector');
-const cors = require('cors');
-require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const server = http.createServer(app);
-
-// CORS 설정
-app.use(cors());
-
-// Socket.io 설정
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
-  transports: ['websocket', 'polling'],
-});
-
-// TikTok Live 연결 관리
-const tiktokConnections = new Map(); // userId -> TikTok connection
-const userSockets = new Map();       // userId -> socket.io socket
-const apiKeys = new Map();           // apiKey -> userId
-
-console.log('🚀 Livooth WebSocket Server Starting...');
-
-// ============================================
-// 헬스 체크 엔드포인트
-// ============================================
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'Livooth Games WebSocket Server',
-    connections: {
-      tiktok: tiktokConnections.size,
-      sockets: userSockets.size,
-    },
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-// ============================================
-// Socket.io 연결 관리
-// ============================================
-
-io.on('connection', (socket) => {
-  console.log('✅ New socket connection:', socket.id);
-
-  // ============================================
-  // TikTok 채널 설정
-  // ============================================
-  socket.on('set_channel', async (data) => {
-    const { tiktokId, apiKey } = data;
-
-    console.log('📥 set_channel received:', { tiktokId, apiKey: apiKey ? 'present' : 'missing' });
-
-    if (!tiktokId || !apiKey) {
-      socket.emit('auth_error', { msg: 'Missing tiktokId or apiKey' });
-      return;
+    cors: {
+        origin: "*", 
+        methods: ["GET", "POST"]
     }
+});
 
-    // TODO: Validate API key against your database
-    // For now, we'll use it as a unique identifier
-    const userId = apiKey; // In production, validate and get userId from database
+// ============================================================
+// ★ [1] 환경변수 설정 (Supabase & Session ID)
+// ============================================================
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+// ★ 틱톡 로그인 세션 ID 추가 (옵션)
+const tiktokSessionId = process.env.TIKTOK_SESSION_ID; 
 
-    // Store socket for this user
-    userSockets.set(userId, socket);
-    apiKeys.set(apiKey, userId);
-    socket.userId = userId;
-    socket.tiktokId = tiktokId;
+console.log("---------------------------------------------------");
+console.log("[DEBUG] 서버 환경변수 로드 상태:");
+console.log("SUPABASE_URL:", !!supabaseUrl ? "OK" : "MISSING");
+console.log("TIKTOK_SESSION_ID:", !!tiktokSessionId ? "OK (안정성 강화)" : "MISSING (익명 접속)");
+console.log("---------------------------------------------------");
 
-    console.log('✅ User associated:', { userId, tiktokId });
+let supabase = null;
 
-    // 기존 연결이 있으면 종료
-    if (tiktokConnections.has(userId)) {
-      console.log('🔄 Disconnecting existing TikTok connection for user:', userId);
-      const oldConnection = tiktokConnections.get(userId);
-      try {
-        oldConnection.disconnect();
-      } catch (err) {
-        console.error('Error disconnecting old connection:', err);
-      }
-      tiktokConnections.delete(userId);
-    }
-
-    // TikTok Live 연결 시작
+if (supabaseUrl && supabaseKey) {
     try {
-      await connectToTikTokLive(tiktokId, userId, socket);
-    } catch (error) {
-      console.error('❌ Failed to connect to TikTok Live:', error);
-      socket.emit('auth_error', { 
-        msg: 'Failed to connect to TikTok Live: ' + error.message 
-      });
+        supabase = createClient(supabaseUrl, supabaseKey);
+        console.log("✅ Supabase 클라이언트 연결 성공");
+    } catch (err) {
+        console.error("❌ Supabase 연결 에러:", err.message);
     }
-  });
-
-  // ============================================
-  // 소켓 연결 해제
-  // ============================================
-  socket.on('disconnect', () => {
-    console.log('🔌 Socket disconnected:', socket.id);
-
-    if (socket.userId) {
-      const userId = socket.userId;
-      
-      // Remove user socket
-      if (userSockets.get(userId) === socket) {
-        userSockets.delete(userId);
-        console.log('👤 User socket removed:', userId);
-      }
-
-      // Disconnect TikTok Live connection
-      if (tiktokConnections.has(userId)) {
-        const connection = tiktokConnections.get(userId);
-        try {
-          connection.disconnect();
-          console.log('🔌 TikTok Live connection closed for user:', userId);
-        } catch (err) {
-          console.error('Error disconnecting TikTok:', err);
-        }
-        tiktokConnections.delete(userId);
-      }
-    }
-  });
-});
-
-// ============================================
-// TikTok Live 연결 함수
-// ============================================
-
-async function connectToTikTokLive(tiktokUsername, userId, socket) {
-  console.log('🔗 Connecting to TikTok Live:', tiktokUsername);
-
-  // @ 제거
-  const username = tiktokUsername.replace('@', '');
-
-  // TikTok Live Connector 초기화
-  const tiktokConnection = new WebcastPushConnection(username, {
-    processInitialData: true,
-    enableExtendedGiftInfo: true,
-    enableWebsocketUpgrade: true,
-    requestPollingIntervalMs: 1000,
-  });
-
-  // ============================================
-  // TikTok 이벤트 리스너
-  // ============================================
-
-  // 연결 성공
-  tiktokConnection.on('connected', (state) => {
-    console.log('✅ TikTok Live connected:', username);
-    console.log('📊 Stream info:', {
-      roomId: state.roomId,
-      uniqueId: state.uniqueId,
-    });
-
-    socket.emit('tiktok_connected', {
-      username,
-      roomId: state.roomId,
-    });
-  });
-
-  // 연결 해제
-  tiktokConnection.on('disconnected', () => {
-    console.log('🔌 TikTok Live disconnected:', username);
-    socket.emit('tiktok_disconnected', { username });
-  });
-
-  // 에러 처리
-  tiktokConnection.on('error', (error) => {
-    console.error('❌ TikTok Live error:', error);
-    socket.emit('tiktok_error', { 
-      msg: error.message || 'Unknown error' 
-    });
-  });
-
-  // ============================================
-  // 선물 이벤트
-  // ============================================
-  tiktokConnection.on('gift', (data) => {
-    console.log('🎁 Gift received:', {
-      username: data.uniqueId,
-      giftName: data.giftName,
-      count: data.repeatCount,
-    });
-
-    const eventData = {
-      type: 'gift',
-      username: data.uniqueId,
-      giftName: data.giftName,
-      giftId: data.giftId,
-      count: data.repeatCount,
-      diamondCount: data.diamondCount,
-      timestamp: Date.now(),
-    };
-
-    socket.emit('game_event', eventData);
-  });
-
-  // ============================================
-  // 좋아요 이벤트
-  // ============================================
-  tiktokConnection.on('like', (data) => {
-    console.log('❤️ Like received:', {
-      username: data.uniqueId,
-      count: data.likeCount,
-    });
-
-    const eventData = {
-      type: 'like',
-      username: data.uniqueId,
-      count: data.likeCount,
-      totalLikes: data.totalLikeCount,
-      timestamp: Date.now(),
-    };
-
-    socket.emit('game_event', eventData);
-  });
-
-  // ============================================
-  // 공유 이벤트
-  // ============================================
-  tiktokConnection.on('share', (data) => {
-    console.log('🔗 Share received:', {
-      username: data.uniqueId,
-    });
-
-    const eventData = {
-      type: 'share',
-      username: data.uniqueId,
-      timestamp: Date.now(),
-    };
-
-    socket.emit('game_event', eventData);
-  });
-
-  // ============================================
-  // 팔로우 이벤트
-  // ============================================
-  tiktokConnection.on('follow', (data) => {
-    console.log('👥 Follow received:', {
-      username: data.uniqueId,
-    });
-
-    const eventData = {
-      type: 'follow',
-      username: data.uniqueId,
-      timestamp: Date.now(),
-    };
-
-    socket.emit('game_event', eventData);
-  });
-
-  // ============================================
-  // 채팅 메시지
-  // ============================================
-  tiktokConnection.on('chat', (data) => {
-    console.log('💬 Chat received:', {
-      username: data.uniqueId,
-      message: data.comment,
-    });
-
-    const chatData = {
-      username: data.uniqueId,
-      message: data.comment,
-      timestamp: Date.now(),
-    };
-
-    socket.emit('chat', chatData);
-  });
-
-  // ============================================
-  // 스트림 종료
-  // ============================================
-  tiktokConnection.on('streamEnd', () => {
-    console.log('📺 Stream ended:', username);
-    socket.emit('stream_end', { username });
-  });
-
-  // ============================================
-  // TikTok Live 연결 시작
-  // ============================================
-
-  try {
-    await tiktokConnection.connect();
-    
-    // 연결 저장
-    tiktokConnections.set(userId, tiktokConnection);
-    
-    console.log('✅ TikTok Live connection established for:', username);
-  } catch (error) {
-    console.error('❌ Failed to connect to TikTok Live:', error);
-    throw error;
-  }
+} else {
+    console.warn("⚠️ [경고] SUPABASE 환경변수 누락. Railway 설정을 확인하세요.");
 }
 
-// ============================================
-// 서버 시작
-// ============================================
+const activeConnections = {};
 
-const PORT = process.env.PORT || 3000;
+const GIFT_MAPPING = {
+    "5670": { type: "soldier", power: 10 },
+    "5671": { type: "tank", power: 100 },
+    "5678": { type: "boss", power: 1000 }
+};
 
-server.listen(PORT, () => {
-  console.log('🚀 Livooth WebSocket Server running on port:', PORT);
-  console.log('🌐 Server URL: http://localhost:' + PORT);
-  console.log('🎮 Ready to accept game connections!');
+io.on('connection', (socket) => {
+    console.log(`[접속] 클라이언트 연결됨 (${socket.id})`);
+
+    socket.on('set_channel', async (data) => {
+        let tiktokId, apiKey;
+
+        if (typeof data === 'object') {
+            tiktokId = data.tiktokId;
+            apiKey = data.apiKey;
+        } else {
+            tiktokId = data;
+            apiKey = null;
+        }
+
+        if (!tiktokId) {
+            socket.emit('auth_error', { msg: "TikTok ID가 필요합니다." });
+            return;
+        }
+
+        console.log(`[요청] ${tiktokId} 연결 시도 (API Key: ${apiKey ? '***' : '없음'})`);
+
+        // ========================================================
+        // ★ API Key 기반 인증
+        // ========================================================
+        
+        if (supabase) {
+            if (!apiKey) {
+                console.log(`>> [차단] API Key 누락`);
+                socket.emit('auth_error', { msg: "API Key가 필요합니다." });
+                return; 
+            }
+
+            try {
+                // Step 1: API Key 검증
+                const { data: keyData, error: keyError } = await supabase
+                    .from('kv_store_b168a9f6')
+                    .select('key')
+                    .eq('value', apiKey)
+                    .like('key', 'api_key:%')
+                    .maybeSingle();
+
+                if (keyError || !keyData) {
+                    console.log(`>> [차단] 유효하지 않은 API Key: ${apiKey}`);
+                    socket.emit('auth_error', { msg: "유효하지 않은 인증키입니다." });
+                    setTimeout(() => socket.disconnect(), 1000);
+                    return;
+                }
+
+                const userId = keyData.key.replace('api_key:', '');
+                console.log(`>> [인증 성공] User ID: ${userId}`);
+
+                // Step 2: 구독 만료일 확인
+                const kvKey = `subscription:${userId}`;
+                const { data: subDataRaw, error: subError } = await supabase
+                    .from('kv_store_b168a9f6')
+                    .select('value')
+                    .eq('key', kvKey)
+                    .single();
+
+                let isSubscribed = false;
+                let expireDateStr = "정보 없음";
+
+                if (!subError && subDataRaw && subDataRaw.value) {
+                    const subInfo = subDataRaw.value;
+                    expireDateStr = subInfo.endDate;
+                    
+                    if (new Date(subInfo.endDate) > new Date()) {
+                        isSubscribed = true;
+                        console.log(`>> [구독 유효] 만료일: ${expireDateStr}`);
+                    } else {
+                        console.log(`>> [구독 만료] 만료일: ${expireDateStr}`);
+                    }
+                }
+
+                if (!isSubscribed) {
+                    socket.emit('auth_error', { 
+                        msg: `구독이 만료되었습니다. (만료일: ${expireDateStr})` 
+                    });
+                    setTimeout(() => socket.disconnect(), 1000);
+                    return;
+                }
+
+            } catch (error) {
+                console.error('>> [오류] 인증 처리 예외:', error);
+                socket.emit('auth_error', { msg: "인증 처리 중 오류 발생" });
+                return;
+            }
+        } else {
+            console.warn("⚠️ [경고] DB 연결 안됨. 개발 모드로 접속 허용.");
+        }
+
+        console.log(`>> [접속 허용] 방송 연결 시작: ${tiktokId}`);
+
+        socket.join(tiktokId);
+        
+        if (activeConnections[tiktokId]) {
+            console.log(`>> [알림] 이미 연결된 방송입니다.`);
+            return;
+        }
+        
+        startTikTokConnection(tiktokId);
+    });
+
+    socket.on('disconnect', () => {
+        // console.log(`[연결 해제] ${socket.id}`);
+    });
 });
 
-// ============================================
-// 프로세스 종료 처리
-// ============================================
+function startTikTokConnection(tiktokId) {
+    // ★ Session ID 적용 (환경변수에 있으면 사용)
+    let options = {
+        processInitialData: false,
+        enableExtendedGiftInfo: true,
+        enableWebsocketUpgrade: true,
+        requestPollingIntervalMs: 2000
+    };
 
-process.on('SIGINT', () => {
-  console.log('\n⚠️ Shutting down server...');
-  
-  // Disconnect all TikTok connections
-  for (const [userId, connection] of tiktokConnections.entries()) {
-    try {
-      connection.disconnect();
-      console.log('🔌 Disconnected TikTok connection for user:', userId);
-    } catch (err) {
-      console.error('Error disconnecting:', err);
+    if (tiktokSessionId) {
+        options.sessionId = tiktokSessionId;
+        // console.log(`>> [Info] Session ID를 사용하여 접속합니다.`);
     }
-  }
-  
-  server.close(() => {
-    console.log('👋 Server shut down successfully');
-    process.exit(0);
-  });
+
+    let connection = new WebcastPushConnection(tiktokId, options);
+
+    connection.connect().then(state => {
+        console.info(`[연결 성공] RoomID: ${state.roomId}`);
+    }).catch(err => {
+        console.error(`[연결 실패] ${tiktokId}:`, err);
+        delete activeConnections[tiktokId];
+    });
+
+    connection.on('gift', data => {
+        if (data.giftType === 1 && !data.repeatEnd) return;
+        
+        const giftId = data.giftId.toString();
+        const coins = data.diamondCount * data.repeatCount;
+        
+        let gameData = {
+            type: 'gift',
+            user: data.uniqueId,
+            giftName: data.giftName,
+            iconUrl: data.giftPictureUrl,
+            coins: coins,
+            amount: data.repeatCount,
+            unitType: 'none'
+        };
+
+        if (GIFT_MAPPING[giftId]) {
+            gameData.unitType = GIFT_MAPPING[giftId].type;
+        } else {
+            if (coins >= 100) gameData.unitType = "boss";
+            else if (coins >= 10) gameData.unitType = "tank";
+            else gameData.unitType = "soldier";
+        }
+
+        io.to(tiktokId).emit('game_event', gameData);
+    });
+
+    connection.on('chat', data => {
+        io.to(tiktokId).emit('chat', { user: data.uniqueId, msg: data.comment });
+    });
+
+    connection.on('social', data => {
+        let evt = null;
+        if (data.displayType.includes('follow')) evt = 'follow';
+        if (data.displayType.includes('share')) evt = 'share';
+        if (evt) {
+            io.to(tiktokId).emit('game_event', { type: evt, user: data.uniqueId });
+        }
+    });
+    
+    connection.on('like', data => {
+         io.to(tiktokId).emit('game_event', { 
+             type: 'like', 
+             user: data.uniqueId, 
+             count: data.likeCount, 
+             total: data.totalLikeCount 
+         });
+    });
+
+    connection.on('streamEnd', () => {
+        console.log(`[방송 종료] ${tiktokId}`);
+        delete activeConnections[tiktokId];
+    });
+
+    activeConnections[tiktokId] = connection;
+}
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`★ Livooth Server Running on Port ${PORT}`);
 });
